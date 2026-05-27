@@ -1,0 +1,78 @@
+name: Nightly Flatpak Build
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  nightly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install flatpak and flatpak-builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+
+      - name: Setup Flathub and install runtimes
+        run: |
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y flathub \
+            org.gnome.Platform//48 \
+            org.gnome.Sdk//48 \
+            org.freedesktop.Sdk.Extension.node22//24.08 \
+            org.flatpak.Builder
+
+      - name: Restore flatpak-builder cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .flatpak-builder/downloads
+            .flatpak-builder/git
+          key: flatpak-builder-${{ github.run_id }}
+          restore-keys: |
+            flatpak-builder-
+
+      - name: Build Flatpak
+        run: |
+          flatpak-builder \
+            --force-clean \
+            --user \
+            --install-deps-from=flathub \
+            --disable-rofiles-fuse \
+            build-dir \
+            org.droposs.client.yml
+
+      - name: Verify build
+        run: bash scripts/verify-s01-build.sh
+
+      - name: Create .flatpak bundle
+        run: |
+          flatpak build-bundle \
+            ~/.local/share/flatpak/repo \
+            drop-app.flatpak \
+            org.droposs.client \
+            master
+
+      - name: Save flatpak-builder cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .flatpak-builder/downloads
+            .flatpak-builder/git
+          key: flatpak-builder-${{ github.run_id }}
+
+      - name: Upload .flatpak artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: drop-app-nightly
+          path: drop-app.flatpak
+          retention-days: 90

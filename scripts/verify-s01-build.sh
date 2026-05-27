@@ -86,7 +86,7 @@ fi
 # Step 3: Verify runtime metadata
 echo ""
 echo "--- Step 3: Runtime metadata check ---"
-METADATA_FILE="$BUILD_DIR/files/metadata"
+METADATA_FILE="$BUILD_DIR/metadata"
 if test -f "$METADATA_FILE"; then
     if grep -q 'org.gnome.Platform' "$METADATA_FILE"; then
         RUNTIME_LINE=$(grep 'runtime=' "$METADATA_FILE" | head -1)

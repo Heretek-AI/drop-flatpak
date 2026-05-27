@@ -8,7 +8,7 @@ command: drop-app
 finish-args:
 - --socket=wayland
 - --socket=fallback-x11
-- --socket=session-dbus
+- --socket=session-bus
 - --share=network
 - --filesystem=xdg-download
 - --talk-name=org.freedesktop.Notifications
@@ -21,6 +21,8 @@ cleanup:
 modules:
 - name: drop-app-bootstrap
   buildsystem: simple
+  no-debuginfo: true
+  no-debuginfo-compression: true
   build-options:
     append-path: /usr/lib/sdk/node22/bin
     env:
@@ -75,6 +77,11 @@ modules:
     url: https://github.com/Drop-OSS/drop-app
     commit: c9ceb3f50ea061f0023f87211775e8380a181cbc
     disable-shallow-clone: true
+  - type: file
+    url: https://github.com/pnpm/pnpm/releases/download/v11.3.0/pnpm-linux-x64.tar.gz
+    sha256: 6eb506b53297eb1186ba0cbff1577bb26d17713835a01a5342dcafae550827ce
+    dest-filename: pnpm-linux-x64.tar.gz
+    dest: flatpak-node/pnpm-vendor
   - type: file
     url: https://registry.npmjs.org/@emnapi/runtime/-/runtime-1.7.1.tgz
     sha512: 3d5b49af90a62f060053d3d90cc213668479880392858444a11e39132c8badb9ed579d2675e3d38149f80263b0f7421f723fb1da4463773af51cfdd1acd88718
@@ -3476,10 +3483,129 @@ modules:
     dest-filename: zopflipng-bin-6.0.1.tgz
     dest: flatpak-node/pnpm-tarballs
   - type: inline
-    contents: "from __future__ import annotations\n\nimport base64\nimport contextlib\nimport hashlib\nimport json\nimport os\nimport re\nimport sqlite3\nimport struct\nimport sys\nimport tarfile\nimport time\nfrom collections.abc import Mapping\n\n_SANITIZE_RE = re.compile(r'[\\\\/:*?\"<>|]')\n_MAX_LENGTH_WITHOUT_HASH = 120\n\n\ndef _msgpack_pack(obj: object) -> bytes:\n    \"\"\"Minimal msgpack packer matching msgpackr with useRecords: true.\n\n    msgpackr reserves the byte range 0x40-0x7F for record IDs when useRecords\n    is enabled (pnpm's config).  Standard msgpack uses 0x00-0x7F for positive\n    fixints, but this packer caps them at 0x3F and emits a uint 8 prefix (0xcc)\n    for 64-255 to avoid aliasing with record ID bytes.\n    \"\"\"\n\n    def _pack_int(val: int) -> bytes:\n        # Positive fixint capped at 0x3F — 0x40-0x7F are msgpackr record IDs\n        if 0 <= val <= 0x3F:\n            return val.to_bytes(1, 'big')\n        if -32 <= val < 0:\n            return val.to_bytes(1, 'big', signed=True)\n        if val >= 0:\n            if val <= 0xFF:\n                return b'\\xcc' + val.to_bytes(1, 'big')\n            if val <= 0xFFFF:\n                return b'\\xcd' + val.to_bytes(2, 'big')\n            if val <= 0xFFFFFFFF:\n                return b'\\xce' + val.to_bytes(4, 'big')\n            return b'\\xcf' + val.to_bytes(8, 'big')\n        if val >= -0x80:\n            return b'\\xd0' + val.to_bytes(1, 'big', signed=True)\n        if val >= -0x8000:\n            return b'\\xd1' + val.to_bytes(2, 'big', signed=True)\n        if val >= -0x80000000:\n            return b'\\xd2' + val.to_bytes(4, 'big', signed=True)\n        return b'\\xd3' + val.to_bytes(8, 'big', signed=True)\n\n    def _pack_str(val: str) -> bytes:\n        data = val.encode('utf-8')\n        length = len(data)\n        if length <= 0x1F:\n            return (0xA0 | length).to_bytes(1, 'big') + data\n        if length <= 0xFF:\n            return b'\\xd9' + length.to_bytes(1, 'big') + data\n        if length <= 0xFFFF:\n            return b'\\xda' + length.to_bytes(2, 'big') + data\n        return b'\\xdb' + length.to_bytes(4, 'big') + data\n\n    if obj is None:\n        return b'\\xc0'\n    if isinstance(obj, bool):\n        return b'\\xc3' if obj else b'\\xc2'\n    if isinstance(obj, int):\n        return _pack_int(obj)\n    if isinstance(obj, float):\n        return b'\\xcb' + struct.pack('>d', obj)\n    if isinstance(obj, str):\n        return _pack_str(obj)\n    if isinstance(obj, dict):\n        length = len(obj)\n        if length <= 0x0F:\n            result = (0x80 | length).to_bytes(1, 'big')\n        elif length <= 0xFFFF:\n            result = b'\\xde' + length.to_bytes(2, 'big')\n        else:\n            result = b'\\xdf' + length.to_bytes(4, 'big')\n        for key, val in obj.items():\n            result += _msgpack_pack(key) + _msgpack_pack(val)\n        return result\n    if isinstance(obj, (list, tuple)):\n        length = len(obj)\n        if length <= 0x0F:\n            result = (0x90 | length).to_bytes(1, 'big')\n        elif length <= 0xFFFF:\n            result = b'\\xdc' + length.to_bytes(2, 'big')\n        else:\n            result = b'\\xdd' + length.to_bytes(4, 'big')\n        for item in obj:\n            result += _msgpack_pack(item)\n        return result\n    raise TypeError(f'Unsupported type for msgpack: {type(obj)}')\n\n\nRECORD_HEADER = b'\\xd4\\x72'\n\n\ndef _pack_v11_store_entry(\n    files: dict[str, dict[str, object]],\n    manifest: dict[str, str] | None = None,\n) -> bytes:\n    \"\"\"Encode a store v11 entry using msgpackr-compatible record extensions.\n\n    msgpackr with ``useRecords: true, moreTypes: true`` decodes:\n\n    - standard msgpack maps (0x80/0xde/0xdf) as JavaScript ``Map`` objects\n      (iterable, supports ``for..of``)\n    - record extensions (0x72) as plain objects (dot-notation access)\n\n    The ``files`` field must be a Map so pnpm can iterate it with ``for..of``.\n    Everything else must use record extensions so dot-notation works\n    (e.g. ``pkgIndex.algo``, ``info.digest``,\
-      \ ``manifest.name``).\n    \"\"\"\n\n    def _record(obj: Mapping[str, object], struct_id: int) -> bytes:\n        keys = list(obj.keys())\n        result = RECORD_HEADER + struct_id.to_bytes(1, 'big')\n        result += _msgpack_pack(keys)\n        for k in keys:\n            result += _msgpack_pack(obj[k])\n        return result\n\n    def _fixmap(length: int) -> bytes:\n        if length <= 0x0F:\n            return (0x80 | length).to_bytes(1, 'big')\n        if length <= 0xFFFF:\n            return b'\\xde' + length.to_bytes(2, 'big')\n        return b'\\xdf' + length.to_bytes(4, 'big')\n\n    # Pack file entries as records, build files map as standard msgpack map\n    files_map_bytes = _fixmap(len(files))\n    for fname, finfo in files.items():\n        files_map_bytes += _msgpack_pack(fname) + _record(finfo, 0x41)\n\n    # Outer store_entry as record (struct_id 0x40)\n    store_entry_keys = ['algo', 'requiresBuild', 'files']\n    if manifest is not None:\n        store_entry_keys.append('manifest')\n\n    # Record with fixed entries\n    result = RECORD_HEADER + b'\\x40' + _msgpack_pack(store_entry_keys)\n    # This is hardcoded to use sha512 per pnpm's behavior, see @pnpm/store.cafs/index and\n    # file digest logic below\n    result += _msgpack_pack('sha512')  # algo\n    result += _msgpack_pack(False)  # requiresBuild\n    result += files_map_bytes  # files (standard map → iterable Map in JS)\n\n    if manifest is not None:\n        result += _record(manifest, 0x42)\n    return result\n\n\ndef populate_store(manifest_path: str, tarball_dir: str, store_dir: str) -> None:\n    with open(manifest_path, encoding='utf-8') as f:\n        manifest = json.load(f)\n\n    store_version = manifest['store_version']\n    packages = manifest['packages']\n\n    index_db: sqlite3.Connection | None = None\n\n    store = os.path.join(store_dir, store_version)\n    os.makedirs(os.path.join(store, 'files'), exist_ok=True)\n    if store_version == 'v11':\n        index_db = sqlite3.connect(os.path.join(store, 'index.db'))\n        index_db.execute('PRAGMA busy_timeout=5000')\n        index_db.execute('PRAGMA journal_mode=WAL')\n        index_db.execute('PRAGMA synchronous=NORMAL')\n        index_db.execute('PRAGMA temp_store=MEMORY')\n        index_db.execute(\n            'CREATE TABLE IF NOT EXISTS package_index ('\n            '  key TEXT PRIMARY KEY,'\n            '  data BLOB NOT NULL'\n            ') WITHOUT ROWID'\n        )\n    else:\n        os.makedirs(os.path.join(store, 'index'), exist_ok=True)\n\n    now = int(time.time() * 1000)\n\n    for tarball_name, info in packages.items():\n        tarball_path = os.path.join(tarball_dir, tarball_name)\n        if not os.path.isfile(tarball_path):\n            raise FileNotFoundError(tarball_path)\n\n        _process_tarball(\n            tarball_path=tarball_path,\n            pkg_name=info['name'],\n            pkg_version=info['version'],\n            integrity=info['integrity'],\n            integrity_digest=info['integrity_digest'],\n            integrity_algo=info['integrity_algo'],\n            store=store,\n            now=now,\n            tarball_url=info.get('tarball_url'),\n            store_version=store_version,\n            index_db=index_db,\n        )\n\n    if index_db is not None:\n        index_db.commit()\n        index_db.close()\n\n\ndef _process_tarball(\n    *,\n    tarball_path: str,\n    pkg_name: str,\n    pkg_version: str,\n    integrity: str,\n    integrity_digest: str,\n    integrity_algo: str,\n    store: str,\n    now: int,\n    tarball_url: str | None = None,\n    store_version: str = 'v3',\n    index_db: sqlite3.Connection | None = None,\n) -> None:\n    index_files: dict[str, dict[str, object]] = {}\n    file_digests: dict[str, str] = {}\n    real_pkg_name = pkg_name\n    real_pkg_version = pkg_version\n\n    with tarfile.open(tarball_path, 'r:gz') as tf:\n        for member in tf.getmembers():\n            if not member.isfile():\n                continue\n            fobj = tf.extractfile(member)\n            if fobj is None:\n        \
-      \        continue\n            data = fobj.read()\n\n            if member.name.endswith('package.json') and member.name.count('/') <= 1:\n                with contextlib.suppress(ValueError, TypeError, UnicodeDecodeError):\n                    pkg_data = json.loads(data.decode('utf-8'))\n                    if isinstance(pkg_data, dict):\n                        if 'name' in pkg_data and isinstance(pkg_data['name'], str):\n                            real_pkg_name = pkg_data['name']\n                        if 'version' in pkg_data and isinstance(\n                            pkg_data['version'], str\n                        ):\n                            real_pkg_version = pkg_data['version']\n\n            digest = hashlib.sha512(data).digest()\n            file_hex = digest.hex()\n            is_exec = bool(member.mode & 0o111)\n\n            cas_dir = os.path.join(store, 'files', file_hex[:2])\n            cas_name = file_hex[2:] + ('-exec' if is_exec else '')\n            cas_path = os.path.join(cas_dir, cas_name)\n            if not os.path.exists(cas_path):\n                os.makedirs(cas_dir, exist_ok=True)\n                with open(cas_path, 'wb') as out:\n                    out.write(data)\n                if is_exec:\n                    os.chmod(cas_path, 0o755)\n\n            rel_name = member.name\n            if '/' in rel_name:\n                rel_name = rel_name.split('/', 1)[1]\n\n            b64 = base64.b64encode(digest).decode()\n            index_files[rel_name] = {\n                'checkedAt': now,\n                'integrity': f'sha512-{b64}',\n                'mode': member.mode,\n                'size': len(data),\n            }\n            file_digests[rel_name] = file_hex\n\n    if store_version == 'v11':\n        assert index_db is not None\n        # pnpm v11 store index keys use the raw package name (e.g. @scope/pkg),\n        # not the filesystem-sanitized form (@scope+pkg), since keys are stored\n        # in SQLite, not as filenames.\n        raw_pkg_id = f'{pkg_name}@{pkg_version}'\n        key = f'{integrity_algo}-{integrity}\\t{raw_pkg_id}'\n\n        v11_files: dict[str, dict[str, object]] = {}\n        for rel_name, finfo in index_files.items():\n            checked_at = finfo['checkedAt']\n            assert isinstance(checked_at, int)\n            v11_files[rel_name] = {\n                'checkedAt': float(checked_at),  # float64 avoids msgpackr BigInt\n                'digest': file_digests[rel_name],\n                'mode': finfo['mode'],\n                'size': finfo['size'],\n            }\n\n        manifest = None\n        if real_pkg_name or real_pkg_version:\n            manifest = {\n                'name': real_pkg_name,\n                'version': real_pkg_version,\n            }\n\n        entry_bytes = _pack_v11_store_entry(v11_files, manifest)\n\n        # It's currently not possible to fully determine which store key pnpm will use,\n        # so we insert multiple keys to ensure pnpm can find the entry it wants.\n\n        index_db.execute(\n            'INSERT OR REPLACE INTO package_index (key, data) VALUES (?, ?)',\n            (key, entry_bytes),\n        )\n\n        if tarball_url:\n            url_key = f'{tarball_url}\\t{raw_pkg_id}'\n            index_db.execute(\n                'INSERT OR REPLACE INTO package_index (key, data) VALUES (?, ?)',\n                (url_key, entry_bytes),\n            )\n\n            # pnpm looks up git-hosted tarballs (codeload.github.com,\n            # bitbucket.org, gitlab.com) and tarballs without integrity by\n            # {tarball_url}\\tbuilt(not-built) — see pickStoreIndexKey in @pnpm/store.index.\n            pkgid_key = f'{tarball_url}\\t'\n            index_db.execute(\n                'INSERT OR REPLACE INTO package_index (key, data) VALUES (?, ?)',\n                (pkgid_key + 'built', entry_bytes),\n            )\n            index_db.execute(\n                'INSERT OR REPLACE INTO package_index (key, data) VALUES (?, ?)',\n                (pkgid_key + 'not-built', entry_bytes),\n            )\n\
-      \    else:\n        pkg_id = _SANITIZE_RE.sub('+', f'{pkg_name}@{pkg_version}')\n\n        index_data = {\n            'name': real_pkg_name,\n            'version': real_pkg_version,\n            'requiresBuild': False,\n            'files': index_files,\n        }\n\n        idx_prefix = integrity_digest[:2]\n        idx_rest = integrity_digest[2:64]\n        idx_dir = os.path.join(store, 'index', idx_prefix)\n        os.makedirs(idx_dir, exist_ok=True)\n        idx_path = os.path.join(idx_dir, f'{idx_rest}-{pkg_id}.json')\n        with open(idx_path, 'w', encoding='utf-8') as out:\n            json.dump(index_data, out)\n\n        # For tarball-URL packages, also create an index entry keyed by the URL hash\n        # this is how pnpm looks up tarball deps without integrity\n        if tarball_url:\n            if store_version == 'v3':\n                url_hash = hashlib.sha256(tarball_url.encode()).hexdigest()\n                url_idx_prefix = url_hash[:2]\n                url_idx_rest = url_hash[2:64]\n                url_idx_dir = os.path.join(store, 'index', url_idx_prefix)\n                os.makedirs(url_idx_dir, exist_ok=True)\n                url_idx_path = os.path.join(\n                    url_idx_dir, f'{url_idx_rest}-{pkg_id}.json'\n                )\n                with open(url_idx_path, 'w', encoding='utf-8') as out:\n                    json.dump(index_data, out)\n            else:\n                url_dir_name = re.sub(r'[:/]', '+', tarball_url)\n                if (\n                    len(url_dir_name) > _MAX_LENGTH_WITHOUT_HASH\n                    or url_dir_name != url_dir_name.lower()\n                ):\n                    url_dir_name = f'{url_dir_name[: _MAX_LENGTH_WITHOUT_HASH - 33]}_{hashlib.sha256(url_dir_name.encode()).hexdigest()[:32]}'\n                url_idx_dir = os.path.join(store, url_dir_name)\n                os.makedirs(url_idx_dir, exist_ok=True)\n                url_idx_path = os.path.join(url_idx_dir, 'integrity.json')\n                with open(url_idx_path, 'w', encoding='utf-8') as out:\n                    json.dump(index_data, out)\n\n\nif __name__ == '__main__':\n    if len(sys.argv) != 4:\n        print(\n            f'Usage: {sys.argv[0]} <manifest.json> <tarball-dir> <store-dir>',\n            file=sys.stderr,\n        )\n        sys.exit(1)\n    populate_store(sys.argv[1], sys.argv[2], sys.argv[3])\n"
+    contents: "from __future__ import annotations\n\nimport base64\nimport contextlib\nimport hashlib\nimport json\nimport\
+      \ os\nimport re\nimport sqlite3\nimport struct\nimport sys\nimport tarfile\nimport time\nfrom collections.abc import\
+      \ Mapping\n\n_SANITIZE_RE = re.compile(r'[\\\\/:*?\"<>|]')\n_MAX_LENGTH_WITHOUT_HASH = 120\n\n\ndef _msgpack_pack(obj:\
+      \ object) -> bytes:\n    \"\"\"Minimal msgpack packer matching msgpackr with useRecords: true.\n\n    msgpackr reserves\
+      \ the byte range 0x40-0x7F for record IDs when useRecords\n    is enabled (pnpm's config).  Standard msgpack uses 0x00-0x7F\
+      \ for positive\n    fixints, but this packer caps them at 0x3F and emits a uint 8 prefix (0xcc)\n    for 64-255 to avoid\
+      \ aliasing with record ID bytes.\n    \"\"\"\n\n    def _pack_int(val: int) -> bytes:\n        # Positive fixint capped\
+      \ at 0x3F \u2014 0x40-0x7F are msgpackr record IDs\n        if 0 <= val <= 0x3F:\n            return val.to_bytes(1,\
+      \ 'big')\n        if -32 <= val < 0:\n            return val.to_bytes(1, 'big', signed=True)\n        if val >= 0:\n\
+      \            if val <= 0xFF:\n                return b'\\xcc' + val.to_bytes(1, 'big')\n            if val <= 0xFFFF:\n\
+      \                return b'\\xcd' + val.to_bytes(2, 'big')\n            if val <= 0xFFFFFFFF:\n                return\
+      \ b'\\xce' + val.to_bytes(4, 'big')\n            return b'\\xcf' + val.to_bytes(8, 'big')\n        if val >= -0x80:\n\
+      \            return b'\\xd0' + val.to_bytes(1, 'big', signed=True)\n        if val >= -0x8000:\n            return b'\\\
+      xd1' + val.to_bytes(2, 'big', signed=True)\n        if val >= -0x80000000:\n            return b'\\xd2' + val.to_bytes(4,\
+      \ 'big', signed=True)\n        return b'\\xd3' + val.to_bytes(8, 'big', signed=True)\n\n    def _pack_str(val: str)\
+      \ -> bytes:\n        data = val.encode('utf-8')\n        length = len(data)\n        if length <= 0x1F:\n          \
+      \  return (0xA0 | length).to_bytes(1, 'big') + data\n        if length <= 0xFF:\n            return b'\\xd9' + length.to_bytes(1,\
+      \ 'big') + data\n        if length <= 0xFFFF:\n            return b'\\xda' + length.to_bytes(2, 'big') + data\n    \
+      \    return b'\\xdb' + length.to_bytes(4, 'big') + data\n\n    if obj is None:\n        return b'\\xc0'\n    if isinstance(obj,\
+      \ bool):\n        return b'\\xc3' if obj else b'\\xc2'\n    if isinstance(obj, int):\n        return _pack_int(obj)\n\
+      \    if isinstance(obj, float):\n        return b'\\xcb' + struct.pack('>d', obj)\n    if isinstance(obj, str):\n  \
+      \      return _pack_str(obj)\n    if isinstance(obj, dict):\n        length = len(obj)\n        if length <= 0x0F:\n\
+      \            result = (0x80 | length).to_bytes(1, 'big')\n        elif length <= 0xFFFF:\n            result = b'\\\
+      xde' + length.to_bytes(2, 'big')\n        else:\n            result = b'\\xdf' + length.to_bytes(4, 'big')\n       \
+      \ for key, val in obj.items():\n            result += _msgpack_pack(key) + _msgpack_pack(val)\n        return result\n\
+      \    if isinstance(obj, (list, tuple)):\n        length = len(obj)\n        if length <= 0x0F:\n            result =\
+      \ (0x90 | length).to_bytes(1, 'big')\n        elif length <= 0xFFFF:\n            result = b'\\xdc' + length.to_bytes(2,\
+      \ 'big')\n        else:\n            result = b'\\xdd' + length.to_bytes(4, 'big')\n        for item in obj:\n     \
+      \       result += _msgpack_pack(item)\n        return result\n    raise TypeError(f'Unsupported type for msgpack: {type(obj)}')\n\
+      \n\nRECORD_HEADER = b'\\xd4\\x72'\n\n\ndef _pack_v11_store_entry(\n    files: dict[str, dict[str, object]],\n    manifest:\
+      \ dict[str, str] | None = None,\n) -> bytes:\n    \"\"\"Encode a store v11 entry using msgpackr-compatible record extensions.\n\
+      \n    msgpackr with ``useRecords: true, moreTypes: true`` decodes:\n\n    - standard msgpack maps (0x80/0xde/0xdf) as\
+      \ JavaScript ``Map`` objects\n      (iterable, supports ``for..of``)\n    - record extensions (0x72) as plain objects\
+      \ (dot-notation access)\n\n    The ``files`` field must be a Map so pnpm can iterate it with ``for..of``.\n    Everything\
+      \ else must use record extensions so dot-notation works\n    (e.g. ``pkgIndex.algo``, ``info.digest``, ``manifest.name``).\n\
+      \    \"\"\"\n\n    def _record(obj: Mapping[str, object], struct_id: int) -> bytes:\n        keys = list(obj.keys())\n\
+      \        result = RECORD_HEADER + struct_id.to_bytes(1, 'big')\n        result += _msgpack_pack(keys)\n        for k\
+      \ in keys:\n            result += _msgpack_pack(obj[k])\n        return result\n\n    def _fixmap(length: int) -> bytes:\n\
+      \        if length <= 0x0F:\n            return (0x80 | length).to_bytes(1, 'big')\n        if length <= 0xFFFF:\n \
+      \           return b'\\xde' + length.to_bytes(2, 'big')\n        return b'\\xdf' + length.to_bytes(4, 'big')\n\n   \
+      \ # Pack file entries as records, build files map as standard msgpack map\n    files_map_bytes = _fixmap(len(files))\n\
+      \    for fname, finfo in files.items():\n        files_map_bytes += _msgpack_pack(fname) + _record(finfo, 0x41)\n\n\
+      \    # Outer store_entry as record (struct_id 0x40)\n    store_entry_keys = ['algo', 'requiresBuild', 'files']\n   \
+      \ if manifest is not None:\n        store_entry_keys.append('manifest')\n\n    # Record with fixed entries\n    result\
+      \ = RECORD_HEADER + b'\\x40' + _msgpack_pack(store_entry_keys)\n    # This is hardcoded to use sha512 per pnpm's behavior,\
+      \ see @pnpm/store.cafs/index and\n    # file digest logic below\n    result += _msgpack_pack('sha512')  # algo\n   \
+      \ result += _msgpack_pack(False)  # requiresBuild\n    result += files_map_bytes  # files (standard map \u2192 iterable\
+      \ Map in JS)\n\n    if manifest is not None:\n        result += _record(manifest, 0x42)\n    return result\n\n\ndef\
+      \ populate_store(manifest_path: str, tarball_dir: str, store_dir: str) -> None:\n    with open(manifest_path, encoding='utf-8')\
+      \ as f:\n        manifest = json.load(f)\n\n    store_version = manifest['store_version']\n    packages = manifest['packages']\n\
+      \n    index_db: sqlite3.Connection | None = None\n\n    store = os.path.join(store_dir, store_version)\n    os.makedirs(os.path.join(store,\
+      \ 'files'), exist_ok=True)\n    if store_version == 'v11':\n        index_db = sqlite3.connect(os.path.join(store, 'index.db'))\n\
+      \        index_db.execute('PRAGMA busy_timeout=5000')\n        index_db.execute('PRAGMA journal_mode=WAL')\n       \
+      \ index_db.execute('PRAGMA synchronous=NORMAL')\n        index_db.execute('PRAGMA temp_store=MEMORY')\n        index_db.execute(\n\
+      \            'CREATE TABLE IF NOT EXISTS package_index ('\n            '  key TEXT PRIMARY KEY,'\n            '  data\
+      \ BLOB NOT NULL'\n            ') WITHOUT ROWID'\n        )\n    else:\n        os.makedirs(os.path.join(store, 'index'),\
+      \ exist_ok=True)\n\n    now = int(time.time() * 1000)\n\n    for tarball_name, info in packages.items():\n        tarball_path\
+      \ = os.path.join(tarball_dir, tarball_name)\n        if not os.path.isfile(tarball_path):\n            raise FileNotFoundError(tarball_path)\n\
+      \n        _process_tarball(\n            tarball_path=tarball_path,\n            pkg_name=info['name'],\n          \
+      \  pkg_version=info['version'],\n            integrity=info['integrity'],\n            integrity_digest=info['integrity_digest'],\n\
+      \            integrity_algo=info['integrity_algo'],\n            store=store,\n            now=now,\n            tarball_url=info.get('tarball_url'),\n\
+      \            store_version=store_version,\n            index_db=index_db,\n        )\n\n    if index_db is not None:\n\
+      \        index_db.commit()\n        index_db.close()\n\n\ndef _process_tarball(\n    *,\n    tarball_path: str,\n  \
+      \  pkg_name: str,\n    pkg_version: str,\n    integrity: str,\n    integrity_digest: str,\n    integrity_algo: str,\n\
+      \    store: str,\n    now: int,\n    tarball_url: str | None = None,\n    store_version: str = 'v3',\n    index_db:\
+      \ sqlite3.Connection | None = None,\n) -> None:\n    index_files: dict[str, dict[str, object]] = {}\n    file_digests:\
+      \ dict[str, str] = {}\n    real_pkg_name = pkg_name\n    real_pkg_version = pkg_version\n\n    with tarfile.open(tarball_path,\
+      \ 'r:gz') as tf:\n        for member in tf.getmembers():\n            if not member.isfile():\n                continue\n\
+      \            fobj = tf.extractfile(member)\n            if fobj is None:\n                continue\n            data\
+      \ = fobj.read()\n\n            if member.name.endswith('package.json') and member.name.count('/') <= 1:\n          \
+      \      with contextlib.suppress(ValueError, TypeError, UnicodeDecodeError):\n                    pkg_data = json.loads(data.decode('utf-8'))\n\
+      \                    if isinstance(pkg_data, dict):\n                        if 'name' in pkg_data and isinstance(pkg_data['name'],\
+      \ str):\n                            real_pkg_name = pkg_data['name']\n                        if 'version' in pkg_data\
+      \ and isinstance(\n                            pkg_data['version'], str\n                        ):\n              \
+      \              real_pkg_version = pkg_data['version']\n\n            digest = hashlib.sha512(data).digest()\n      \
+      \      file_hex = digest.hex()\n            is_exec = bool(member.mode & 0o111)\n\n            cas_dir = os.path.join(store,\
+      \ 'files', file_hex[:2])\n            cas_name = file_hex[2:] + ('-exec' if is_exec else '')\n            cas_path =\
+      \ os.path.join(cas_dir, cas_name)\n            if not os.path.exists(cas_path):\n                os.makedirs(cas_dir,\
+      \ exist_ok=True)\n                with open(cas_path, 'wb') as out:\n                    out.write(data)\n         \
+      \       if is_exec:\n                    os.chmod(cas_path, 0o755)\n\n            rel_name = member.name\n         \
+      \   if '/' in rel_name:\n                rel_name = rel_name.split('/', 1)[1]\n\n            b64 = base64.b64encode(digest).decode()\n\
+      \            index_files[rel_name] = {\n                'checkedAt': now,\n                'integrity': f'sha512-{b64}',\n\
+      \                'mode': member.mode,\n                'size': len(data),\n            }\n            file_digests[rel_name]\
+      \ = file_hex\n\n    if store_version == 'v11':\n        assert index_db is not None\n        # pnpm v11 store index\
+      \ keys use the raw package name (e.g. @scope/pkg),\n        # not the filesystem-sanitized form (@scope+pkg), since\
+      \ keys are stored\n        # in SQLite, not as filenames.\n        raw_pkg_id = f'{pkg_name}@{pkg_version}'\n      \
+      \  key = f'{integrity_algo}-{integrity}\\t{raw_pkg_id}'\n\n        v11_files: dict[str, dict[str, object]] = {}\n  \
+      \      for rel_name, finfo in index_files.items():\n            checked_at = finfo['checkedAt']\n            assert\
+      \ isinstance(checked_at, int)\n            v11_files[rel_name] = {\n                'checkedAt': float(checked_at),\
+      \  # float64 avoids msgpackr BigInt\n                'digest': file_digests[rel_name],\n                'mode': finfo['mode'],\n\
+      \                'size': finfo['size'],\n            }\n\n        manifest = None\n        if real_pkg_name or real_pkg_version:\n\
+      \            manifest = {\n                'name': real_pkg_name,\n                'version': real_pkg_version,\n  \
+      \          }\n\n        entry_bytes = _pack_v11_store_entry(v11_files, manifest)\n\n        # It's currently not possible\
+      \ to fully determine which store key pnpm will use,\n        # so we insert multiple keys to ensure pnpm can find the\
+      \ entry it wants.\n\n        index_db.execute(\n            'INSERT OR REPLACE INTO package_index (key, data) VALUES\
+      \ (?, ?)',\n            (key, entry_bytes),\n        )\n\n        if tarball_url:\n            url_key = f'{tarball_url}\\\
+      t{raw_pkg_id}'\n            index_db.execute(\n                'INSERT OR REPLACE INTO package_index (key, data) VALUES\
+      \ (?, ?)',\n                (url_key, entry_bytes),\n            )\n\n            # pnpm looks up git-hosted tarballs\
+      \ (codeload.github.com,\n            # bitbucket.org, gitlab.com) and tarballs without integrity by\n            # {tarball_url}\\\
+      tbuilt(not-built) \u2014 see pickStoreIndexKey in @pnpm/store.index.\n            pkgid_key = f'{tarball_url}\\t'\n\
+      \            index_db.execute(\n                'INSERT OR REPLACE INTO package_index (key, data) VALUES (?, ?)',\n\
+      \                (pkgid_key + 'built', entry_bytes),\n            )\n            index_db.execute(\n               \
+      \ 'INSERT OR REPLACE INTO package_index (key, data) VALUES (?, ?)',\n                (pkgid_key + 'not-built', entry_bytes),\n\
+      \            )\n    else:\n        pkg_id = _SANITIZE_RE.sub('+', f'{pkg_name}@{pkg_version}')\n\n        index_data\
+      \ = {\n            'name': real_pkg_name,\n            'version': real_pkg_version,\n            'requiresBuild': False,\n\
+      \            'files': index_files,\n        }\n\n        idx_prefix = integrity_digest[:2]\n        idx_rest = integrity_digest[2:64]\n\
+      \        idx_dir = os.path.join(store, 'index', idx_prefix)\n        os.makedirs(idx_dir, exist_ok=True)\n        idx_path\
+      \ = os.path.join(idx_dir, f'{idx_rest}-{pkg_id}.json')\n        with open(idx_path, 'w', encoding='utf-8') as out:\n\
+      \            json.dump(index_data, out)\n\n        # For tarball-URL packages, also create an index entry keyed by the\
+      \ URL hash\n        # this is how pnpm looks up tarball deps without integrity\n        if tarball_url:\n          \
+      \  if store_version == 'v3':\n                url_hash = hashlib.sha256(tarball_url.encode()).hexdigest()\n        \
+      \        url_idx_prefix = url_hash[:2]\n                url_idx_rest = url_hash[2:64]\n                url_idx_dir =\
+      \ os.path.join(store, 'index', url_idx_prefix)\n                os.makedirs(url_idx_dir, exist_ok=True)\n          \
+      \      url_idx_path = os.path.join(\n                    url_idx_dir, f'{url_idx_rest}-{pkg_id}.json'\n            \
+      \    )\n                with open(url_idx_path, 'w', encoding='utf-8') as out:\n                    json.dump(index_data,\
+      \ out)\n            else:\n                url_dir_name = re.sub(r'[:/]', '+', tarball_url)\n                if (\n\
+      \                    len(url_dir_name) > _MAX_LENGTH_WITHOUT_HASH\n                    or url_dir_name != url_dir_name.lower()\n\
+      \                ):\n                    url_dir_name = f'{url_dir_name[: _MAX_LENGTH_WITHOUT_HASH - 33]}_{hashlib.sha256(url_dir_name.encode()).hexdigest()[:32]}'\n\
+      \                url_idx_dir = os.path.join(store, url_dir_name)\n                os.makedirs(url_idx_dir, exist_ok=True)\n\
+      \                url_idx_path = os.path.join(url_idx_dir, 'integrity.json')\n                with open(url_idx_path,\
+      \ 'w', encoding='utf-8') as out:\n                    json.dump(index_data, out)\n\n\nif __name__ == '__main__':\n \
+      \   if len(sys.argv) != 4:\n        print(\n            f'Usage: {sys.argv[0]} <manifest.json> <tarball-dir> <store-dir>',\n\
+      \            file=sys.stderr,\n        )\n        sys.exit(1)\n    populate_store(sys.argv[1], sys.argv[2], sys.argv[3])\n"
     dest-filename: populate_pnpm_store.py
     dest: flatpak-node
   - type: inline
@@ -7874,10 +8000,129 @@ modules:
     dest-filename: zip-stream-6.0.1.tgz
     dest: flatpak-node-main/pnpm-tarballs
   - type: inline
-    contents: "from __future__ import annotations\n\nimport base64\nimport contextlib\nimport hashlib\nimport json\nimport os\nimport re\nimport sqlite3\nimport struct\nimport sys\nimport tarfile\nimport time\nfrom collections.abc import Mapping\n\n_SANITIZE_RE = re.compile(r'[\\\\/:*?\"<>|]')\n_MAX_LENGTH_WITHOUT_HASH = 120\n\n\ndef _msgpack_pack(obj: object) -> bytes:\n    \"\"\"Minimal msgpack packer matching msgpackr with useRecords: true.\n\n    msgpackr reserves the byte range 0x40-0x7F for record IDs when useRecords\n    is enabled (pnpm's config).  Standard msgpack uses 0x00-0x7F for positive\n    fixints, but this packer caps them at 0x3F and emits a uint 8 prefix (0xcc)\n    for 64-255 to avoid aliasing with record ID bytes.\n    \"\"\"\n\n    def _pack_int(val: int) -> bytes:\n        # Positive fixint capped at 0x3F — 0x40-0x7F are msgpackr record IDs\n        if 0 <= val <= 0x3F:\n            return val.to_bytes(1, 'big')\n        if -32 <= val < 0:\n            return val.to_bytes(1, 'big', signed=True)\n        if val >= 0:\n            if val <= 0xFF:\n                return b'\\xcc' + val.to_bytes(1, 'big')\n            if val <= 0xFFFF:\n                return b'\\xcd' + val.to_bytes(2, 'big')\n            if val <= 0xFFFFFFFF:\n                return b'\\xce' + val.to_bytes(4, 'big')\n            return b'\\xcf' + val.to_bytes(8, 'big')\n        if val >= -0x80:\n            return b'\\xd0' + val.to_bytes(1, 'big', signed=True)\n        if val >= -0x8000:\n            return b'\\xd1' + val.to_bytes(2, 'big', signed=True)\n        if val >= -0x80000000:\n            return b'\\xd2' + val.to_bytes(4, 'big', signed=True)\n        return b'\\xd3' + val.to_bytes(8, 'big', signed=True)\n\n    def _pack_str(val: str) -> bytes:\n        data = val.encode('utf-8')\n        length = len(data)\n        if length <= 0x1F:\n            return (0xA0 | length).to_bytes(1, 'big') + data\n        if length <= 0xFF:\n            return b'\\xd9' + length.to_bytes(1, 'big') + data\n        if length <= 0xFFFF:\n            return b'\\xda' + length.to_bytes(2, 'big') + data\n        return b'\\xdb' + length.to_bytes(4, 'big') + data\n\n    if obj is None:\n        return b'\\xc0'\n    if isinstance(obj, bool):\n        return b'\\xc3' if obj else b'\\xc2'\n    if isinstance(obj, int):\n        return _pack_int(obj)\n    if isinstance(obj, float):\n        return b'\\xcb' + struct.pack('>d', obj)\n    if isinstance(obj, str):\n        return _pack_str(obj)\n    if isinstance(obj, dict):\n        length = len(obj)\n        if length <= 0x0F:\n            result = (0x80 | length).to_bytes(1, 'big')\n        elif length <= 0xFFFF:\n            result = b'\\xde' + length.to_bytes(2, 'big')\n        else:\n            result = b'\\xdf' + length.to_bytes(4, 'big')\n        for key, val in obj.items():\n            result += _msgpack_pack(key) + _msgpack_pack(val)\n        return result\n    if isinstance(obj, (list, tuple)):\n        length = len(obj)\n        if length <= 0x0F:\n            result = (0x90 | length).to_bytes(1, 'big')\n        elif length <= 0xFFFF:\n            result = b'\\xdc' + length.to_bytes(2, 'big')\n        else:\n            result = b'\\xdd' + length.to_bytes(4, 'big')\n        for item in obj:\n            result += _msgpack_pack(item)\n        return result\n    raise TypeError(f'Unsupported type for msgpack: {type(obj)}')\n\n\nRECORD_HEADER = b'\\xd4\\x72'\n\n\ndef _pack_v11_store_entry(\n    files: dict[str, dict[str, object]],\n    manifest: dict[str, str] | None = None,\n) -> bytes:\n    \"\"\"Encode a store v11 entry using msgpackr-compatible record extensions.\n\n    msgpackr with ``useRecords: true, moreTypes: true`` decodes:\n\n    - standard msgpack maps (0x80/0xde/0xdf) as JavaScript ``Map`` objects\n      (iterable, supports ``for..of``)\n    - record extensions (0x72) as plain objects (dot-notation access)\n\n    The ``files`` field must be a Map so pnpm can iterate it with ``for..of``.\n    Everything else must use record extensions so dot-notation works\n    (e.g. ``pkgIndex.algo``, ``info.digest``,\
-      \ ``manifest.name``).\n    \"\"\"\n\n    def _record(obj: Mapping[str, object], struct_id: int) -> bytes:\n        keys = list(obj.keys())\n        result = RECORD_HEADER + struct_id.to_bytes(1, 'big')\n        result += _msgpack_pack(keys)\n        for k in keys:\n            result += _msgpack_pack(obj[k])\n        return result\n\n    def _fixmap(length: int) -> bytes:\n        if length <= 0x0F:\n            return (0x80 | length).to_bytes(1, 'big')\n        if length <= 0xFFFF:\n            return b'\\xde' + length.to_bytes(2, 'big')\n        return b'\\xdf' + length.to_bytes(4, 'big')\n\n    # Pack file entries as records, build files map as standard msgpack map\n    files_map_bytes = _fixmap(len(files))\n    for fname, finfo in files.items():\n        files_map_bytes += _msgpack_pack(fname) + _record(finfo, 0x41)\n\n    # Outer store_entry as record (struct_id 0x40)\n    store_entry_keys = ['algo', 'requiresBuild', 'files']\n    if manifest is not None:\n        store_entry_keys.append('manifest')\n\n    # Record with fixed entries\n    result = RECORD_HEADER + b'\\x40' + _msgpack_pack(store_entry_keys)\n    # This is hardcoded to use sha512 per pnpm's behavior, see @pnpm/store.cafs/index and\n    # file digest logic below\n    result += _msgpack_pack('sha512')  # algo\n    result += _msgpack_pack(False)  # requiresBuild\n    result += files_map_bytes  # files (standard map → iterable Map in JS)\n\n    if manifest is not None:\n        result += _record(manifest, 0x42)\n    return result\n\n\ndef populate_store(manifest_path: str, tarball_dir: str, store_dir: str) -> None:\n    with open(manifest_path, encoding='utf-8') as f:\n        manifest = json.load(f)\n\n    store_version = manifest['store_version']\n    packages = manifest['packages']\n\n    index_db: sqlite3.Connection | None = None\n\n    store = os.path.join(store_dir, store_version)\n    os.makedirs(os.path.join(store, 'files'), exist_ok=True)\n    if store_version == 'v11':\n        index_db = sqlite3.connect(os.path.join(store, 'index.db'))\n        index_db.execute('PRAGMA busy_timeout=5000')\n        index_db.execute('PRAGMA journal_mode=WAL')\n        index_db.execute('PRAGMA synchronous=NORMAL')\n        index_db.execute('PRAGMA temp_store=MEMORY')\n        index_db.execute(\n            'CREATE TABLE IF NOT EXISTS package_index ('\n            '  key TEXT PRIMARY KEY,'\n            '  data BLOB NOT NULL'\n            ') WITHOUT ROWID'\n        )\n    else:\n        os.makedirs(os.path.join(store, 'index'), exist_ok=True)\n\n    now = int(time.time() * 1000)\n\n    for tarball_name, info in packages.items():\n        tarball_path = os.path.join(tarball_dir, tarball_name)\n        if not os.path.isfile(tarball_path):\n            raise FileNotFoundError(tarball_path)\n\n        _process_tarball(\n            tarball_path=tarball_path,\n            pkg_name=info['name'],\n            pkg_version=info['version'],\n            integrity=info['integrity'],\n            integrity_digest=info['integrity_digest'],\n            integrity_algo=info['integrity_algo'],\n            store=store,\n            now=now,\n            tarball_url=info.get('tarball_url'),\n            store_version=store_version,\n            index_db=index_db,\n        )\n\n    if index_db is not None:\n        index_db.commit()\n        index_db.close()\n\n\ndef _process_tarball(\n    *,\n    tarball_path: str,\n    pkg_name: str,\n    pkg_version: str,\n    integrity: str,\n    integrity_digest: str,\n    integrity_algo: str,\n    store: str,\n    now: int,\n    tarball_url: str | None = None,\n    store_version: str = 'v3',\n    index_db: sqlite3.Connection | None = None,\n) -> None:\n    index_files: dict[str, dict[str, object]] = {}\n    file_digests: dict[str, str] = {}\n    real_pkg_name = pkg_name\n    real_pkg_version = pkg_version\n\n    with tarfile.open(tarball_path, 'r:gz') as tf:\n        for member in tf.getmembers():\n            if not member.isfile():\n                continue\n            fobj = tf.extractfile(member)\n            if fobj is None:\n        \
-      \        continue\n            data = fobj.read()\n\n            if member.name.endswith('package.json') and member.name.count('/') <= 1:\n                with contextlib.suppress(ValueError, TypeError, UnicodeDecodeError):\n                    pkg_data = json.loads(data.decode('utf-8'))\n                    if isinstance(pkg_data, dict):\n                        if 'name' in pkg_data and isinstance(pkg_data['name'], str):\n                            real_pkg_name = pkg_data['name']\n                        if 'version' in pkg_data and isinstance(\n                            pkg_data['version'], str\n                        ):\n                            real_pkg_version = pkg_data['version']\n\n            digest = hashlib.sha512(data).digest()\n            file_hex = digest.hex()\n            is_exec = bool(member.mode & 0o111)\n\n            cas_dir = os.path.join(store, 'files', file_hex[:2])\n            cas_name = file_hex[2:] + ('-exec' if is_exec else '')\n            cas_path = os.path.join(cas_dir, cas_name)\n            if not os.path.exists(cas_path):\n                os.makedirs(cas_dir, exist_ok=True)\n                with open(cas_path, 'wb') as out:\n                    out.write(data)\n                if is_exec:\n                    os.chmod(cas_path, 0o755)\n\n            rel_name = member.name\n            if '/' in rel_name:\n                rel_name = rel_name.split('/', 1)[1]\n\n            b64 = base64.b64encode(digest).decode()\n            index_files[rel_name] = {\n                'checkedAt': now,\n                'integrity': f'sha512-{b64}',\n                'mode': member.mode,\n                'size': len(data),\n            }\n            file_digests[rel_name] = file_hex\n\n    if store_version == 'v11':\n        assert index_db is not None\n        # pnpm v11 store index keys use the raw package name (e.g. @scope/pkg),\n        # not the filesystem-sanitized form (@scope+pkg), since keys are stored\n        # in SQLite, not as filenames.\n        raw_pkg_id = f'{pkg_name}@{pkg_version}'\n        key = f'{integrity_algo}-{integrity}\\t{raw_pkg_id}'\n\n        v11_files: dict[str, dict[str, object]] = {}\n        for rel_name, finfo in index_files.items():\n            checked_at = finfo['checkedAt']\n            assert isinstance(checked_at, int)\n            v11_files[rel_name] = {\n                'checkedAt': float(checked_at),  # float64 avoids msgpackr BigInt\n                'digest': file_digests[rel_name],\n                'mode': finfo['mode'],\n                'size': finfo['size'],\n            }\n\n        manifest = None\n        if real_pkg_name or real_pkg_version:\n            manifest = {\n                'name': real_pkg_name,\n                'version': real_pkg_version,\n            }\n\n        entry_bytes = _pack_v11_store_entry(v11_files, manifest)\n\n        # It's currently not possible to fully determine which store key pnpm will use,\n        # so we insert multiple keys to ensure pnpm can find the entry it wants.\n\n        index_db.execute(\n            'INSERT OR REPLACE INTO package_index (key, data) VALUES (?, ?)',\n            (key, entry_bytes),\n        )\n\n        if tarball_url:\n            url_key = f'{tarball_url}\\t{raw_pkg_id}'\n            index_db.execute(\n                'INSERT OR REPLACE INTO package_index (key, data) VALUES (?, ?)',\n                (url_key, entry_bytes),\n            )\n\n            # pnpm looks up git-hosted tarballs (codeload.github.com,\n            # bitbucket.org, gitlab.com) and tarballs without integrity by\n            # {tarball_url}\\tbuilt(not-built) — see pickStoreIndexKey in @pnpm/store.index.\n            pkgid_key = f'{tarball_url}\\t'\n            index_db.execute(\n                'INSERT OR REPLACE INTO package_index (key, data) VALUES (?, ?)',\n                (pkgid_key + 'built', entry_bytes),\n            )\n            index_db.execute(\n                'INSERT OR REPLACE INTO package_index (key, data) VALUES (?, ?)',\n                (pkgid_key + 'not-built', entry_bytes),\n            )\n\
-      \    else:\n        pkg_id = _SANITIZE_RE.sub('+', f'{pkg_name}@{pkg_version}')\n\n        index_data = {\n            'name': real_pkg_name,\n            'version': real_pkg_version,\n            'requiresBuild': False,\n            'files': index_files,\n        }\n\n        idx_prefix = integrity_digest[:2]\n        idx_rest = integrity_digest[2:64]\n        idx_dir = os.path.join(store, 'index', idx_prefix)\n        os.makedirs(idx_dir, exist_ok=True)\n        idx_path = os.path.join(idx_dir, f'{idx_rest}-{pkg_id}.json')\n        with open(idx_path, 'w', encoding='utf-8') as out:\n            json.dump(index_data, out)\n\n        # For tarball-URL packages, also create an index entry keyed by the URL hash\n        # this is how pnpm looks up tarball deps without integrity\n        if tarball_url:\n            if store_version == 'v3':\n                url_hash = hashlib.sha256(tarball_url.encode()).hexdigest()\n                url_idx_prefix = url_hash[:2]\n                url_idx_rest = url_hash[2:64]\n                url_idx_dir = os.path.join(store, 'index', url_idx_prefix)\n                os.makedirs(url_idx_dir, exist_ok=True)\n                url_idx_path = os.path.join(\n                    url_idx_dir, f'{url_idx_rest}-{pkg_id}.json'\n                )\n                with open(url_idx_path, 'w', encoding='utf-8') as out:\n                    json.dump(index_data, out)\n            else:\n                url_dir_name = re.sub(r'[:/]', '+', tarball_url)\n                if (\n                    len(url_dir_name) > _MAX_LENGTH_WITHOUT_HASH\n                    or url_dir_name != url_dir_name.lower()\n                ):\n                    url_dir_name = f'{url_dir_name[: _MAX_LENGTH_WITHOUT_HASH - 33]}_{hashlib.sha256(url_dir_name.encode()).hexdigest()[:32]}'\n                url_idx_dir = os.path.join(store, url_dir_name)\n                os.makedirs(url_idx_dir, exist_ok=True)\n                url_idx_path = os.path.join(url_idx_dir, 'integrity.json')\n                with open(url_idx_path, 'w', encoding='utf-8') as out:\n                    json.dump(index_data, out)\n\n\nif __name__ == '__main__':\n    if len(sys.argv) != 4:\n        print(\n            f'Usage: {sys.argv[0]} <manifest.json> <tarball-dir> <store-dir>',\n            file=sys.stderr,\n        )\n        sys.exit(1)\n    populate_store(sys.argv[1], sys.argv[2], sys.argv[3])\n"
+    contents: "from __future__ import annotations\n\nimport base64\nimport contextlib\nimport hashlib\nimport json\nimport\
+      \ os\nimport re\nimport sqlite3\nimport struct\nimport sys\nimport tarfile\nimport time\nfrom collections.abc import\
+      \ Mapping\n\n_SANITIZE_RE = re.compile(r'[\\\\/:*?\"<>|]')\n_MAX_LENGTH_WITHOUT_HASH = 120\n\n\ndef _msgpack_pack(obj:\
+      \ object) -> bytes:\n    \"\"\"Minimal msgpack packer matching msgpackr with useRecords: true.\n\n    msgpackr reserves\
+      \ the byte range 0x40-0x7F for record IDs when useRecords\n    is enabled (pnpm's config).  Standard msgpack uses 0x00-0x7F\
+      \ for positive\n    fixints, but this packer caps them at 0x3F and emits a uint 8 prefix (0xcc)\n    for 64-255 to avoid\
+      \ aliasing with record ID bytes.\n    \"\"\"\n\n    def _pack_int(val: int) -> bytes:\n        # Positive fixint capped\
+      \ at 0x3F \u2014 0x40-0x7F are msgpackr record IDs\n        if 0 <= val <= 0x3F:\n            return val.to_bytes(1,\
+      \ 'big')\n        if -32 <= val < 0:\n            return val.to_bytes(1, 'big', signed=True)\n        if val >= 0:\n\
+      \            if val <= 0xFF:\n                return b'\\xcc' + val.to_bytes(1, 'big')\n            if val <= 0xFFFF:\n\
+      \                return b'\\xcd' + val.to_bytes(2, 'big')\n            if val <= 0xFFFFFFFF:\n                return\
+      \ b'\\xce' + val.to_bytes(4, 'big')\n            return b'\\xcf' + val.to_bytes(8, 'big')\n        if val >= -0x80:\n\
+      \            return b'\\xd0' + val.to_bytes(1, 'big', signed=True)\n        if val >= -0x8000:\n            return b'\\\
+      xd1' + val.to_bytes(2, 'big', signed=True)\n        if val >= -0x80000000:\n            return b'\\xd2' + val.to_bytes(4,\
+      \ 'big', signed=True)\n        return b'\\xd3' + val.to_bytes(8, 'big', signed=True)\n\n    def _pack_str(val: str)\
+      \ -> bytes:\n        data = val.encode('utf-8')\n        length = len(data)\n        if length <= 0x1F:\n          \
+      \  return (0xA0 | length).to_bytes(1, 'big') + data\n        if length <= 0xFF:\n            return b'\\xd9' + length.to_bytes(1,\
+      \ 'big') + data\n        if length <= 0xFFFF:\n            return b'\\xda' + length.to_bytes(2, 'big') + data\n    \
+      \    return b'\\xdb' + length.to_bytes(4, 'big') + data\n\n    if obj is None:\n        return b'\\xc0'\n    if isinstance(obj,\
+      \ bool):\n        return b'\\xc3' if obj else b'\\xc2'\n    if isinstance(obj, int):\n        return _pack_int(obj)\n\
+      \    if isinstance(obj, float):\n        return b'\\xcb' + struct.pack('>d', obj)\n    if isinstance(obj, str):\n  \
+      \      return _pack_str(obj)\n    if isinstance(obj, dict):\n        length = len(obj)\n        if length <= 0x0F:\n\
+      \            result = (0x80 | length).to_bytes(1, 'big')\n        elif length <= 0xFFFF:\n            result = b'\\\
+      xde' + length.to_bytes(2, 'big')\n        else:\n            result = b'\\xdf' + length.to_bytes(4, 'big')\n       \
+      \ for key, val in obj.items():\n            result += _msgpack_pack(key) + _msgpack_pack(val)\n        return result\n\
+      \    if isinstance(obj, (list, tuple)):\n        length = len(obj)\n        if length <= 0x0F:\n            result =\
+      \ (0x90 | length).to_bytes(1, 'big')\n        elif length <= 0xFFFF:\n            result = b'\\xdc' + length.to_bytes(2,\
+      \ 'big')\n        else:\n            result = b'\\xdd' + length.to_bytes(4, 'big')\n        for item in obj:\n     \
+      \       result += _msgpack_pack(item)\n        return result\n    raise TypeError(f'Unsupported type for msgpack: {type(obj)}')\n\
+      \n\nRECORD_HEADER = b'\\xd4\\x72'\n\n\ndef _pack_v11_store_entry(\n    files: dict[str, dict[str, object]],\n    manifest:\
+      \ dict[str, str] | None = None,\n) -> bytes:\n    \"\"\"Encode a store v11 entry using msgpackr-compatible record extensions.\n\
+      \n    msgpackr with ``useRecords: true, moreTypes: true`` decodes:\n\n    - standard msgpack maps (0x80/0xde/0xdf) as\
+      \ JavaScript ``Map`` objects\n      (iterable, supports ``for..of``)\n    - record extensions (0x72) as plain objects\
+      \ (dot-notation access)\n\n    The ``files`` field must be a Map so pnpm can iterate it with ``for..of``.\n    Everything\
+      \ else must use record extensions so dot-notation works\n    (e.g. ``pkgIndex.algo``, ``info.digest``, ``manifest.name``).\n\
+      \    \"\"\"\n\n    def _record(obj: Mapping[str, object], struct_id: int) -> bytes:\n        keys = list(obj.keys())\n\
+      \        result = RECORD_HEADER + struct_id.to_bytes(1, 'big')\n        result += _msgpack_pack(keys)\n        for k\
+      \ in keys:\n            result += _msgpack_pack(obj[k])\n        return result\n\n    def _fixmap(length: int) -> bytes:\n\
+      \        if length <= 0x0F:\n            return (0x80 | length).to_bytes(1, 'big')\n        if length <= 0xFFFF:\n \
+      \           return b'\\xde' + length.to_bytes(2, 'big')\n        return b'\\xdf' + length.to_bytes(4, 'big')\n\n   \
+      \ # Pack file entries as records, build files map as standard msgpack map\n    files_map_bytes = _fixmap(len(files))\n\
+      \    for fname, finfo in files.items():\n        files_map_bytes += _msgpack_pack(fname) + _record(finfo, 0x41)\n\n\
+      \    # Outer store_entry as record (struct_id 0x40)\n    store_entry_keys = ['algo', 'requiresBuild', 'files']\n   \
+      \ if manifest is not None:\n        store_entry_keys.append('manifest')\n\n    # Record with fixed entries\n    result\
+      \ = RECORD_HEADER + b'\\x40' + _msgpack_pack(store_entry_keys)\n    # This is hardcoded to use sha512 per pnpm's behavior,\
+      \ see @pnpm/store.cafs/index and\n    # file digest logic below\n    result += _msgpack_pack('sha512')  # algo\n   \
+      \ result += _msgpack_pack(False)  # requiresBuild\n    result += files_map_bytes  # files (standard map \u2192 iterable\
+      \ Map in JS)\n\n    if manifest is not None:\n        result += _record(manifest, 0x42)\n    return result\n\n\ndef\
+      \ populate_store(manifest_path: str, tarball_dir: str, store_dir: str) -> None:\n    with open(manifest_path, encoding='utf-8')\
+      \ as f:\n        manifest = json.load(f)\n\n    store_version = manifest['store_version']\n    packages = manifest['packages']\n\
+      \n    index_db: sqlite3.Connection | None = None\n\n    store = os.path.join(store_dir, store_version)\n    os.makedirs(os.path.join(store,\
+      \ 'files'), exist_ok=True)\n    if store_version == 'v11':\n        index_db = sqlite3.connect(os.path.join(store, 'index.db'))\n\
+      \        index_db.execute('PRAGMA busy_timeout=5000')\n        index_db.execute('PRAGMA journal_mode=WAL')\n       \
+      \ index_db.execute('PRAGMA synchronous=NORMAL')\n        index_db.execute('PRAGMA temp_store=MEMORY')\n        index_db.execute(\n\
+      \            'CREATE TABLE IF NOT EXISTS package_index ('\n            '  key TEXT PRIMARY KEY,'\n            '  data\
+      \ BLOB NOT NULL'\n            ') WITHOUT ROWID'\n        )\n    else:\n        os.makedirs(os.path.join(store, 'index'),\
+      \ exist_ok=True)\n\n    now = int(time.time() * 1000)\n\n    for tarball_name, info in packages.items():\n        tarball_path\
+      \ = os.path.join(tarball_dir, tarball_name)\n        if not os.path.isfile(tarball_path):\n            raise FileNotFoundError(tarball_path)\n\
+      \n        _process_tarball(\n            tarball_path=tarball_path,\n            pkg_name=info['name'],\n          \
+      \  pkg_version=info['version'],\n            integrity=info['integrity'],\n            integrity_digest=info['integrity_digest'],\n\
+      \            integrity_algo=info['integrity_algo'],\n            store=store,\n            now=now,\n            tarball_url=info.get('tarball_url'),\n\
+      \            store_version=store_version,\n            index_db=index_db,\n        )\n\n    if index_db is not None:\n\
+      \        index_db.commit()\n        index_db.close()\n\n\ndef _process_tarball(\n    *,\n    tarball_path: str,\n  \
+      \  pkg_name: str,\n    pkg_version: str,\n    integrity: str,\n    integrity_digest: str,\n    integrity_algo: str,\n\
+      \    store: str,\n    now: int,\n    tarball_url: str | None = None,\n    store_version: str = 'v3',\n    index_db:\
+      \ sqlite3.Connection | None = None,\n) -> None:\n    index_files: dict[str, dict[str, object]] = {}\n    file_digests:\
+      \ dict[str, str] = {}\n    real_pkg_name = pkg_name\n    real_pkg_version = pkg_version\n\n    with tarfile.open(tarball_path,\
+      \ 'r:gz') as tf:\n        for member in tf.getmembers():\n            if not member.isfile():\n                continue\n\
+      \            fobj = tf.extractfile(member)\n            if fobj is None:\n                continue\n            data\
+      \ = fobj.read()\n\n            if member.name.endswith('package.json') and member.name.count('/') <= 1:\n          \
+      \      with contextlib.suppress(ValueError, TypeError, UnicodeDecodeError):\n                    pkg_data = json.loads(data.decode('utf-8'))\n\
+      \                    if isinstance(pkg_data, dict):\n                        if 'name' in pkg_data and isinstance(pkg_data['name'],\
+      \ str):\n                            real_pkg_name = pkg_data['name']\n                        if 'version' in pkg_data\
+      \ and isinstance(\n                            pkg_data['version'], str\n                        ):\n              \
+      \              real_pkg_version = pkg_data['version']\n\n            digest = hashlib.sha512(data).digest()\n      \
+      \      file_hex = digest.hex()\n            is_exec = bool(member.mode & 0o111)\n\n            cas_dir = os.path.join(store,\
+      \ 'files', file_hex[:2])\n            cas_name = file_hex[2:] + ('-exec' if is_exec else '')\n            cas_path =\
+      \ os.path.join(cas_dir, cas_name)\n            if not os.path.exists(cas_path):\n                os.makedirs(cas_dir,\
+      \ exist_ok=True)\n                with open(cas_path, 'wb') as out:\n                    out.write(data)\n         \
+      \       if is_exec:\n                    os.chmod(cas_path, 0o755)\n\n            rel_name = member.name\n         \
+      \   if '/' in rel_name:\n                rel_name = rel_name.split('/', 1)[1]\n\n            b64 = base64.b64encode(digest).decode()\n\
+      \            index_files[rel_name] = {\n                'checkedAt': now,\n                'integrity': f'sha512-{b64}',\n\
+      \                'mode': member.mode,\n                'size': len(data),\n            }\n            file_digests[rel_name]\
+      \ = file_hex\n\n    if store_version == 'v11':\n        assert index_db is not None\n        # pnpm v11 store index\
+      \ keys use the raw package name (e.g. @scope/pkg),\n        # not the filesystem-sanitized form (@scope+pkg), since\
+      \ keys are stored\n        # in SQLite, not as filenames.\n        raw_pkg_id = f'{pkg_name}@{pkg_version}'\n      \
+      \  key = f'{integrity_algo}-{integrity}\\t{raw_pkg_id}'\n\n        v11_files: dict[str, dict[str, object]] = {}\n  \
+      \      for rel_name, finfo in index_files.items():\n            checked_at = finfo['checkedAt']\n            assert\
+      \ isinstance(checked_at, int)\n            v11_files[rel_name] = {\n                'checkedAt': float(checked_at),\
+      \  # float64 avoids msgpackr BigInt\n                'digest': file_digests[rel_name],\n                'mode': finfo['mode'],\n\
+      \                'size': finfo['size'],\n            }\n\n        manifest = None\n        if real_pkg_name or real_pkg_version:\n\
+      \            manifest = {\n                'name': real_pkg_name,\n                'version': real_pkg_version,\n  \
+      \          }\n\n        entry_bytes = _pack_v11_store_entry(v11_files, manifest)\n\n        # It's currently not possible\
+      \ to fully determine which store key pnpm will use,\n        # so we insert multiple keys to ensure pnpm can find the\
+      \ entry it wants.\n\n        index_db.execute(\n            'INSERT OR REPLACE INTO package_index (key, data) VALUES\
+      \ (?, ?)',\n            (key, entry_bytes),\n        )\n\n        if tarball_url:\n            url_key = f'{tarball_url}\\\
+      t{raw_pkg_id}'\n            index_db.execute(\n                'INSERT OR REPLACE INTO package_index (key, data) VALUES\
+      \ (?, ?)',\n                (url_key, entry_bytes),\n            )\n\n            # pnpm looks up git-hosted tarballs\
+      \ (codeload.github.com,\n            # bitbucket.org, gitlab.com) and tarballs without integrity by\n            # {tarball_url}\\\
+      tbuilt(not-built) \u2014 see pickStoreIndexKey in @pnpm/store.index.\n            pkgid_key = f'{tarball_url}\\t'\n\
+      \            index_db.execute(\n                'INSERT OR REPLACE INTO package_index (key, data) VALUES (?, ?)',\n\
+      \                (pkgid_key + 'built', entry_bytes),\n            )\n            index_db.execute(\n               \
+      \ 'INSERT OR REPLACE INTO package_index (key, data) VALUES (?, ?)',\n                (pkgid_key + 'not-built', entry_bytes),\n\
+      \            )\n    else:\n        pkg_id = _SANITIZE_RE.sub('+', f'{pkg_name}@{pkg_version}')\n\n        index_data\
+      \ = {\n            'name': real_pkg_name,\n            'version': real_pkg_version,\n            'requiresBuild': False,\n\
+      \            'files': index_files,\n        }\n\n        idx_prefix = integrity_digest[:2]\n        idx_rest = integrity_digest[2:64]\n\
+      \        idx_dir = os.path.join(store, 'index', idx_prefix)\n        os.makedirs(idx_dir, exist_ok=True)\n        idx_path\
+      \ = os.path.join(idx_dir, f'{idx_rest}-{pkg_id}.json')\n        with open(idx_path, 'w', encoding='utf-8') as out:\n\
+      \            json.dump(index_data, out)\n\n        # For tarball-URL packages, also create an index entry keyed by the\
+      \ URL hash\n        # this is how pnpm looks up tarball deps without integrity\n        if tarball_url:\n          \
+      \  if store_version == 'v3':\n                url_hash = hashlib.sha256(tarball_url.encode()).hexdigest()\n        \
+      \        url_idx_prefix = url_hash[:2]\n                url_idx_rest = url_hash[2:64]\n                url_idx_dir =\
+      \ os.path.join(store, 'index', url_idx_prefix)\n                os.makedirs(url_idx_dir, exist_ok=True)\n          \
+      \      url_idx_path = os.path.join(\n                    url_idx_dir, f'{url_idx_rest}-{pkg_id}.json'\n            \
+      \    )\n                with open(url_idx_path, 'w', encoding='utf-8') as out:\n                    json.dump(index_data,\
+      \ out)\n            else:\n                url_dir_name = re.sub(r'[:/]', '+', tarball_url)\n                if (\n\
+      \                    len(url_dir_name) > _MAX_LENGTH_WITHOUT_HASH\n                    or url_dir_name != url_dir_name.lower()\n\
+      \                ):\n                    url_dir_name = f'{url_dir_name[: _MAX_LENGTH_WITHOUT_HASH - 33]}_{hashlib.sha256(url_dir_name.encode()).hexdigest()[:32]}'\n\
+      \                url_idx_dir = os.path.join(store, url_dir_name)\n                os.makedirs(url_idx_dir, exist_ok=True)\n\
+      \                url_idx_path = os.path.join(url_idx_dir, 'integrity.json')\n                with open(url_idx_path,\
+      \ 'w', encoding='utf-8') as out:\n                    json.dump(index_data, out)\n\n\nif __name__ == '__main__':\n \
+      \   if len(sys.argv) != 4:\n        print(\n            f'Usage: {sys.argv[0]} <manifest.json> <tarball-dir> <store-dir>',\n\
+      \            file=sys.stderr,\n        )\n        sys.exit(1)\n    populate_store(sys.argv[1], sys.argv[2], sys.argv[3])\n"
     dest-filename: populate_pnpm_store.py
     dest: flatpak-node-main
   - type: inline
@@ -7927,21 +8172,38 @@ modules:
     - x86_64
   - type: shell
     commands:
-    - python3 flatpak-node-main/populate_pnpm_store.py flatpak-node-main/pnpm-manifest.json flatpak-node-main/pnpm-tarballs flatpak-node-main/pnpm-store
+    - python3 flatpak-node-main/populate_pnpm_store.py flatpak-node-main/pnpm-manifest.json flatpak-node-main/pnpm-tarballs
+      flatpak-node-main/pnpm-store
     - echo "store-dir=$PWD/flatpak-node-main/pnpm-store" >> .npmrc
     - bash flatpak-node-main/setup_sdk_node_headers.sh
   build-commands:
   - set -eu
+  - tar xzf flatpak-node/pnpm-vendor/pnpm-linux-x64.tar.gz -C /app/bin/ && chmod +x /app/bin/pnpm
   - echo "fetch-retries=0" >> .npmrc && echo "fetch-timeout=1" >> .npmrc && echo "prefer-offline=true" >> .npmrc
-  - python3 -c "import json; m=json.load(open('flatpak-node/pnpm-manifest.json')); m['store_version']='v11'; json.dump(m, open('flatpak-node/pnpm-manifest.json','w'))"
-  - python3 flatpak-node/populate_pnpm_store.py flatpak-node/pnpm-manifest.json flatpak-node/pnpm-tarballs flatpak-node/pnpm-store && echo "store-dir=$PWD/flatpak-node/pnpm-store" >> .npmrc && bash flatpak-node/setup_sdk_node_headers.sh
-  - "cat > pnpm-workspace.yaml << 'PNPMWSEOF'\npackages: []\ntrustLockfile: true\nminimumReleaseAge: 0\nverifyDepsBeforeRun: false\noverrides:\n  cross-spawn@<6.0.6: '>=6.0.6'\n  cross-spawn@>=7.0.0 <7.0.5: '>=7.0.5'\n  form-data@<2.5.4: '>=2.5.4'\n  got@<11.8.5: '>=11.8.5'\n  http-cache-semantics@<4.1.1: '>=4.1.1'\n  lodash@<4.17.21: '>=4.17.21'\n  lodash@>=4.0.0 <4.17.21: '>=4.17.21'\n  minimist@>=1.0.0 <1.2.6: '>=1.2.6'\n  nth-check@<2.0.1: '>=2.0.1'\n  semver-regex@<3.1.3: '>=3.1.3'\n  semver-regex@<3.1.4: '>=3.1.4'\n  semver@>=7.0.0 <7.5.2: '>=7.5.2'\n  sharp@<0.30.5: '>=0.30.5'\n  sharp@<0.32.6: '>=0.32.6'\n  tmp@<=0.2.3: '>=0.2.4'\n  tough-cookie@<4.1.3: '>=4.1.3'\n  trim-newlines@<3.0.1: '>=3.0.1'\nPNPMWSEOF\n"
+  - python3 -c "import json; m=json.load(open('flatpak-node/pnpm-manifest.json')); m['store_version']='v11'; json.dump(m,
+    open('flatpak-node/pnpm-manifest.json','w'))"
+  - python3 flatpak-node/populate_pnpm_store.py flatpak-node/pnpm-manifest.json flatpak-node/pnpm-tarballs flatpak-node/pnpm-store
+    && echo "store-dir=$PWD/flatpak-node/pnpm-store" >> .npmrc && bash flatpak-node/setup_sdk_node_headers.sh
+  - "cat > pnpm-workspace.yaml << 'PNPMWSEOF'\npackages: []\ntrustLockfile: true\nminimumReleaseAge: 0\nverifyDepsBeforeRun:\
+    \ false\noverrides:\n  cross-spawn@<6.0.6: '>=6.0.6'\n  cross-spawn@>=7.0.0 <7.0.5: '>=7.0.5'\n  form-data@<2.5.4: '>=2.5.4'\n\
+    \  got@<11.8.5: '>=11.8.5'\n  http-cache-semantics@<4.1.1: '>=4.1.1'\n  lodash@<4.17.21: '>=4.17.21'\n  lodash@>=4.0.0\
+    \ <4.17.21: '>=4.17.21'\n  minimist@>=1.0.0 <1.2.6: '>=1.2.6'\n  nth-check@<2.0.1: '>=2.0.1'\n  semver-regex@<3.1.3: '>=3.1.3'\n\
+    \  semver-regex@<3.1.4: '>=3.1.4'\n  semver@>=7.0.0 <7.5.2: '>=7.5.2'\n  sharp@<0.30.5: '>=0.30.5'\n  sharp@<0.32.6: '>=0.32.6'\n\
+    \  tmp@<=0.2.3: '>=0.2.4'\n  tough-cookie@<4.1.3: '>=4.1.3'\n  trim-newlines@<3.0.1: '>=3.0.1'\nPNPMWSEOF\n"
   - /app/bin/pnpm install --offline --frozen-lockfile --no-verify-store --store-dir flatpak-node/pnpm-store
-  - echo "store-dir=../flatpak-node-main/pnpm-store" >> main/.npmrc && echo "fetch-retries=0" >> main/.npmrc && echo "prefer-offline=true" >> main/.npmrc
-  - "cat > main/pnpm-workspace.yaml << 'MAINWSEOF'\npackages: []\ntrustLockfile: true\nminimumReleaseAge: 0\nverifyDepsBeforeRun: false\noverrides:\n  devalue@>=5.1.0 <5.6.2: '>=5.6.2'\n  devalue@>=5.3.0 <=5.6.1: '>=5.6.2'\n  diff@>=6.0.0 <8.0.3: '>=8.0.3'\n  h3@<=1.15.4: '>=1.15.5'\n  lodash@>=4.0.0 <=4.17.22: '>=4.17.23'\n  markdown-it@>=13.0.0 <14.1.1: '>=14.1.1'\n  node-forge@<1.3.2: '>=1.3.2'\n  seroval@<1.4.1: '>=1.4.1'\n  seroval@<=1.4.0: '>=1.4.1'\n  tar@<7.5.7: '>=7.5.7'\n  tar@<=7.5.2: '>=7.5.3'\n  tar@<=7.5.3: '>=7.5.4'\nMAINWSEOF\n"
-  - python3 -c "import json; m=json.load(open('flatpak-node-main/pnpm-manifest.json')); m['store_version']='v11'; json.dump(m, open('flatpak-node-main/pnpm-manifest.json','w'))"
-  - python3 flatpak-node-main/populate_pnpm_store.py flatpak-node-main/pnpm-manifest.json flatpak-node-main/pnpm-tarballs flatpak-node-main/pnpm-store
-  - sed -i 's|await spawn("pnpm install")|await spawn("pnpm install --offline --frozen-lockfile --no-verify-store --store-dir ../flatpak-node-main/pnpm-store")|' build.mjs
+  - echo "store-dir=../flatpak-node-main/pnpm-store" >> main/.npmrc && echo "fetch-retries=0" >> main/.npmrc && echo "prefer-offline=true"
+    >> main/.npmrc
+  - "cat > main/pnpm-workspace.yaml << 'MAINWSEOF'\npackages: []\ntrustLockfile: true\nminimumReleaseAge: 0\nverifyDepsBeforeRun:\
+    \ false\noverrides:\n  devalue@>=5.1.0 <5.6.2: '>=5.6.2'\n  devalue@>=5.3.0 <=5.6.1: '>=5.6.2'\n  diff@>=6.0.0 <8.0.3:\
+    \ '>=8.0.3'\n  h3@<=1.15.4: '>=1.15.5'\n  lodash@>=4.0.0 <=4.17.22: '>=4.17.23'\n  markdown-it@>=13.0.0 <14.1.1: '>=14.1.1'\n\
+    \  node-forge@<1.3.2: '>=1.3.2'\n  seroval@<1.4.1: '>=1.4.1'\n  seroval@<=1.4.0: '>=1.4.1'\n  tar@<7.5.7: '>=7.5.7'\n\
+    \  tar@<=7.5.2: '>=7.5.3'\n  tar@<=7.5.3: '>=7.5.4'\nMAINWSEOF\n"
+  - python3 -c "import json; m=json.load(open('flatpak-node-main/pnpm-manifest.json')); m['store_version']='v11'; json.dump(m,
+    open('flatpak-node-main/pnpm-manifest.json','w'))"
+  - python3 flatpak-node-main/populate_pnpm_store.py flatpak-node-main/pnpm-manifest.json flatpak-node-main/pnpm-tarballs
+    flatpak-node-main/pnpm-store
+  - sed -i 's|await spawn("pnpm install")|await spawn("pnpm install --offline --frozen-lockfile --no-verify-store --store-dir
+    ../flatpak-node-main/pnpm-store")|' build.mjs
   - node build.mjs
   - 'test -f main/.output/public/index.html && echo "Nuxt build verified: main/.output/public/index.html exists"'
 - name: drop-app-rust
@@ -7965,6 +8227,25 @@ modules:
     url: https://github.com/drop-oss/native_model
     commit: a91b422cbd53116df1f20b2459fb3d8257458bfd
     dest: flatpak-cargo/git/native_model-a91b422
+  - type: file
+    path: org.droposs.client.desktop
+  - type: file
+    path: org.droposs.client.metainfo.xml
+  - type: archive
+    url: https://static.rust-lang.org/dist/rustc-nightly-x86_64-unknown-linux-gnu.tar.xz
+    sha256: 6e280cf8889524b092214f9ed7c293bee43680988b00cc48cdac76c9df352c1d
+    strip-components: 1
+    dest: rust-nightly/rustc
+  - type: archive
+    url: https://static.rust-lang.org/dist/cargo-nightly-x86_64-unknown-linux-gnu.tar.xz
+    sha256: c5421d7fad5e5c3596ba6c0748e4441a87deb237a56e1ef7c1551c0dc93dd3cd
+    strip-components: 1
+    dest: rust-nightly/cargo
+  - type: archive
+    url: https://static.rust-lang.org/dist/rust-std-nightly-x86_64-unknown-linux-gnu.tar.xz
+    sha256: d590f515075c54918d48cb16c77677633b5a5245e4055655fdc82c1ab7983f13
+    strip-components: 1
+    dest: rust-nightly/rust-std
   - type: archive
     archive-type: tar-gzip
     url: https://static.crates.io/crates/adler2/adler2-2.0.1.crate
@@ -15438,6 +15719,13 @@ modules:
     dest-filename: config
   build-commands:
   - set -eu
+  - mkdir -p /app/lib/rust-nightly/{bin,lib}
+  - cp -r rust-nightly/rustc/rustc/bin/* /app/lib/rust-nightly/bin/
+  - cp -r rust-nightly/rustc/rustc/lib/* /app/lib/rust-nightly/lib/
+  - cp -r rust-nightly/cargo/cargo/bin/* /app/lib/rust-nightly/bin/
+  - cp -r rust-nightly/cargo/cargo/share /app/lib/rust-nightly/share/
+  - cp -r rust-nightly/rust-std/rust-std-x86_64-unknown-linux-gnu/lib/rustlib/. /app/lib/rust-nightly/lib/rustlib/
+  - LD_LIBRARY_PATH=/app/lib/rust-nightly/lib /app/lib/rust-nightly/bin/rustc --version
   - mkdir -p .cargo
   - echo "[source.crates-io]" > .cargo/config.toml
   - echo "replace-with = \"vendored-sources\"" >> .cargo/config.toml
@@ -15445,11 +15733,13 @@ modules:
   - echo "directory = \"$PWD/cargo/vendor\"" >> .cargo/config.toml
   - echo '' >> .cargo/config.toml
   - echo '[patch."https://github.com/Drop-OSS/droplet-rs"]' >> .cargo/config.toml
-  - echo 'droplet-rs = { path = "$PWD/cargo/vendor/droplet-rs" }' >> .cargo/config.toml
+  - echo "droplet-rs = { path = \"$PWD/cargo/vendor/droplet-rs\" }" >> .cargo/config.toml
   - echo '[patch."https://github.com/Drop-OSS/native_model"]' >> .cargo/config.toml
-  - echo 'native_model = { path = "$PWD/cargo/vendor/native_model" }' >> .cargo/config.toml
+  - echo "native_model = { path = \"$PWD/cargo/vendor/native_model\" }" >> .cargo/config.toml
   - cd src-tauri && cargo build --release
+  - cd ..
   - install -Dm755 src-tauri/target/release/drop-app /app/bin/drop-app
-  - for size in 32x32 128x128 "128x128@2x"; do install -Dm644 "src-tauri/icons/${size}.png" "/app/share/icons/hicolor/${size}/apps/org.droposs.client.png"; done
+  - for size in 32x32 128x128 "128x128@2x"; do install -Dm644 "src-tauri/icons/${size}.png" "/app/share/icons/hicolor/${size}/apps/org.droposs.client.png";
+    done
   - install -Dm644 org.droposs.client.desktop /app/share/applications/org.droposs.client.desktop
   - install -Dm644 org.droposs.client.metainfo.xml /app/share/metainfo/org.droposs.client.metainfo.xml
