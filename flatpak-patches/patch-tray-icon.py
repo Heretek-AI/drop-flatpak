@@ -5,12 +5,8 @@ The upstream source unconditionally imports tauri::tray::TrayIconBuilder
 and constructs a tray icon.  In the GNOME Flatpak sandbox, libappindicator
 is not available, so the tray-icon feature causes a runtime panic.
 
-This script strips:
-  - The `tray::TrayIconBuilder,` import line
-  - The menu-item boilerplate and TrayIconBuilder::new() block
-  - Replaces the block with `let _ = app;` (a no-op)
-
-Uses line-based delimiters for reliability across upstream changes.
+Removes the tray import line and the menu+run_on_tray setup block,
+replacing with a no-op `let _ = app;`.
 """
 
 import sys
@@ -22,41 +18,34 @@ def patch_lib_rs(path: str) -> None:
 
     out: list[str] = []
 
-    # Lines to skip (exact match)
-    tray_import = "    tray::TrayIconBuilder,\n"
-
-    # Start and end markers for the menu + tray setup block
+    import_line = "    tray::TrayIconBuilder,\n"
     block_start = '                let open_menu_item = MenuItem::with_id(app, "open", "Open", true, None::<&str>)\n'
-    block_end_contains = '.expect("error while setting up tray menu")'
+    block_end_marker = '.expect("error while setting up tray menu")'
 
-    skip_until_block_end = False
+    state = "passthrough"  # passthrough | skipping_block | drop_one
 
     for line in lines:
-        if line == tray_import:
-            continue  # skip the tray import
-
-        if line == block_start:
-            skip_until_block_end = True
-            continue  # skip first line of block
-
-        if skip_until_block_end:
-            if block_end_contains in line:
-                # Last line of the skipped block; the next meaningful
-                # line is `                });` which we replace with `let _ = app;`
-                skip_until_block_end = False
+        if line == import_line:
             continue
 
-        out.append(line)
+        if state == "passthrough":
+            if line == block_start:
+                state = "skipping_block"
+                continue
+            out.append(line)
 
-    # Replace the first `                });\n` after the patched block
-    # with a no-op.  The tray setup block ends with:  });  });  (nested
-    # closures), and we need to preserve the outer `});`.
-    for i, line in enumerate(out):
-        if line == "                });\n":
-            # This is the closing of the menu/tray setup closure.
-            # Insert `let _ = app;` before it and move on.
-            out[i] = "                let _ = app;\n                });\n"
-            break
+        elif state == "skipping_block":
+            if block_end_marker in line:
+                state = "drop_one"
+            # skip this line either way
+            continue
+
+        elif state == "drop_one":
+            # This is the `                });` closing run_on_tray(...)
+            # We drop it and insert the no-op.
+            out.append("                let _ = app;\n")
+            state = "passthrough"
+            continue
 
     with open(path, "w") as f:
         f.writelines(out)
