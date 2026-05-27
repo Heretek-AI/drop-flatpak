@@ -8221,7 +8221,7 @@ modules:
     disable-shallow-clone: true
   - type: file
     path: flatpak-patches/patch-tray-icon.py
-    dest: flatpak-patches/patch-tray-icon.py
+    dest: flatpak-patches
   - type: git
     url: https://github.com/drop-oss/droplet-rs
     commit: f17a585b563d874ef9a09c27be5169b7e728d148
