@@ -8219,6 +8219,9 @@ modules:
     url: https://github.com/Drop-OSS/drop-app
     commit: c9ceb3f50ea061f0023f87211775e8380a181cbc
     disable-shallow-clone: true
+  - type: file
+    path: flatpak-patches/patch-tray-icon.py
+    dest: flatpak-patches/patch-tray-icon.py
   - type: git
     url: https://github.com/drop-oss/droplet-rs
     commit: f17a585b563d874ef9a09c27be5169b7e728d148
@@ -15737,6 +15740,7 @@ modules:
   - echo '[patch."https://github.com/Drop-OSS/native_model"]' >> .cargo/config.toml
   - echo "native_model = { path = \"$PWD/cargo/vendor/native_model\" }" >> .cargo/config.toml
   - sed -i 's/"tray-icon",\?\s*//g' src-tauri/Cargo.toml
+  - python3 flatpak-patches/patch-tray-icon.py src-tauri/src/lib.rs
   - cd src-tauri && cargo build --release
   - cd ..
   - install -Dm755 src-tauri/target/release/drop-app /app/bin/drop-app
