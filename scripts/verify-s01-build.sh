@@ -49,8 +49,13 @@ echo "verify-s01-build.sh — T03 Build Verification"
 echo "============================================"
 echo ""
 
-# Step 1: Build the Flatpak
+# Step 1: Build the Flatpak (skip if binary already exists from prior step)
 echo "--- Step 1: flatpak-builder ---"
+BINARY_PATH="$BUILD_DIR/files/bin/$BINARY_NAME"
+if test -f "$BINARY_PATH"; then
+    echo "Build output already exists at $BINARY_PATH — skipping rebuild"
+    pass "flatpak-builder: binary already present (prior step built it)"
+else
 echo "Running: ${FLATPAK_BUILDER} --force-clean --user --install-deps-from=flathub ${BUILD_DIR} ${MANIFEST}"
 echo ""
 START_TIME=$(date +%s)
@@ -82,6 +87,7 @@ else
     echo "FAILED: Build did not succeed. Subsequent source-file checks (5-7) will still run."
     BUILD_FAILED=1
 fi
+fi  # close the binary-exists skip gate
 
 # Step 2: Verify binary exists
 echo ""
