@@ -18,10 +18,35 @@
   <launchable type="desktop-id">org.droposs.client.desktop</launchable>
   <url type="homepage">https://github.com/Drop-OSS/drop-app</url>
   <url type="bugtracker">https://github.com/Drop-OSS/drop-app/issues</url>
-  <developer_name>Drop OSS</developer_name>
+  <developer id="org.droposs">
+    <name>Drop OSS</name>
+  </developer>
   <categories>
     <category>Game</category>
   </categories>
+  <content_rating type="oars-1.1">
+    <content_attribute id="violence-cartoon">none</content_attribute>
+    <content_attribute id="violence-fantasy">none</content_attribute>
+    <content_attribute id="violence-realistic">none</content_attribute>
+    <content_attribute id="violence-bloodshed">none</content_attribute>
+    <content_attribute id="language-profanity">none</content_attribute>
+    <content_attribute id="language-humor">none</content_attribute>
+    <content_attribute id="language-discrimination">none</content_attribute>
+    <content_attribute id="social-chat">none</content_attribute>
+    <content_attribute id="social-info">none</content_attribute>
+    <content_attribute id="social-audio">none</content_attribute>
+    <content_attribute id="social-location">none</content_attribute>
+    <content_attribute id="social-contacts">none</content_attribute>
+    <content_attribute id="money-purchasing">none</content_attribute>
+    <content_attribute id="money-gambling">none</content_attribute>
+  </content_rating>
+  <releases>
+    <release version="0.1.0" date="2026-01-01">
+      <description>
+        <p>Initial Flatpak packaging release.</p>
+      </description>
+    </release>
+  </releases>
   <recommends>
     <display_length compare="ge">1280</display_length>
   </recommends>
