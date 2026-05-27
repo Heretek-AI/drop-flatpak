@@ -15736,6 +15736,7 @@ modules:
   - echo "droplet-rs = { path = \"$PWD/cargo/vendor/droplet-rs\" }" >> .cargo/config.toml
   - echo '[patch."https://github.com/Drop-OSS/native_model"]' >> .cargo/config.toml
   - echo "native_model = { path = \"$PWD/cargo/vendor/native_model\" }" >> .cargo/config.toml
+  - sed -i '/features = \[/,/\]/ s/"tray-icon"//; s/,  ,/,/; s/\[ ,/\[/; s/, ,/,/; s/, \]/\]/' src-tauri/Cargo.toml
   - cd src-tauri && cargo build --release
   - cd ..
   - install -Dm755 src-tauri/target/release/drop-app /app/bin/drop-app
