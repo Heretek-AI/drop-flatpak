@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.droposs.client</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Drop Desktop Client</name>
+  <summary>A modern game launcher for the Drop platform</summary>
+  <description>
+    <p>
+      Drop Desktop Client is a modern, self-hosted game distribution platform
+      that lets you manage, download, and play your game library with ease.
+    </p>
+    <p>
+      Built with Tauri and Nuxt, it provides a fast, native desktop experience
+      with automatic updates, cloud saves, and seamless game management.
+    </p>
+  </description>
+  <launchable type="desktop-id">org.droposs.client.desktop</launchable>
+  <url type="homepage">https://github.com/Drop-OSS/drop-app</url>
+  <url type="bugtracker">https://github.com/Drop-OSS/drop-app/issues</url>
+  <developer_name>Drop OSS</developer_name>
+  <categories>
+    <category>Game</category>
+  </categories>
+  <recommends>
+    <display_length compare="ge">1280</display_length>
+  </recommends>
+</component>

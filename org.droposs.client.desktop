@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Drop Desktop Client
+Comment=A modern game launcher for the Drop platform
+Exec=drop-app
+Icon=org.droposs.client
+Categories=Game;
+MimeType=x-scheme-handler/drop;
+Terminal=false
+StartupNotify=true
