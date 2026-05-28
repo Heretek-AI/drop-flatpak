@@ -18,6 +18,11 @@ import yaml
 
 MANIFEST_PATH = "org.droposs.client.yml"
 EXPECTED_MODULE_NAMES = ["drop-app-bootstrap", "drop-app-nuxt", "drop-app-rust"]
+# libappindicator is included as a path reference (string), not a named module dict.
+# It expands to ~4 sub-modules at build time. When counted in the YAML source:
+# 3 named modules (bootstrap, nuxt, rust) + 1 path include (libappindicator) = 4 entries.
+EXPECTED_MODULE_COUNT_NO_LIBAPPINDICATOR = 3
+EXPECTED_MODULE_COUNT_WITH_LIBAPPINDICATOR = 4
 
 
 def checksum_key(source: dict) -> str:
@@ -58,14 +63,23 @@ def main():
 
     # 2. Check modules exist
     modules = manifest.get("modules", [])
-    if len(modules) != 3:
-        errors.append(f"Expected 3 modules, found {len(modules)}")
+    # Separate named modules from path includes
+    named_modules = [m for m in modules if isinstance(m, dict) and "name" in m]
+    path_includes = [m for m in modules if isinstance(m, str)]
+    
+    if len(named_modules) != EXPECTED_MODULE_COUNT_NO_LIBAPPINDICATOR:
+        errors.append(f"Expected {EXPECTED_MODULE_COUNT_NO_LIBAPPINDICATOR} named modules, found {len(named_modules)}")
+    
+    if len(path_includes) != 1:
+        errors.append(f"Expected 1 path include (libappindicator), found {len(path_includes)}: {path_includes}")
+    elif not any("libappindicator" in str(p) for p in path_includes):
+        errors.append(f"Expected libappindicator path include, found: {path_includes}")
 
-    actual_names = [m.get("name", "<unnamed>") for m in modules]
+    actual_names = [m.get("name", "<unnamed>") for m in named_modules]
 
     # 3. Check module names
     for i, expected_name in enumerate(EXPECTED_MODULE_NAMES):
-        if i >= len(modules):
+        if i >= len(named_modules):
             errors.append(f"Missing module: {expected_name}")
         elif actual_names[i] != expected_name:
             errors.append(
@@ -73,10 +87,10 @@ def main():
             )
 
     if not errors:
-        print(f"✅ Exactly 3 modules with correct names: {', '.join(actual_names)}")
+        print(f"✅ 3 named modules: {', '.join(actual_names)} + libappindicator path include")
 
-    # 4. Check each module has sources and build-commands
-    for mod in modules:
+    # 4. Check each named module has sources and build-commands
+    for mod in named_modules:
         name = mod.get("name", "<unnamed>")
         sources = mod.get("sources", [])
         cmds = mod.get("build-commands", [])
@@ -88,7 +102,7 @@ def main():
 
     # 5. Verify checksums — archive sources use sha256 (64 hex chars), file sources may use sha512 (128 hex chars) or sha256
     sha_violations = []
-    for mod in modules:
+    for mod in named_modules:
         name = mod.get("name", "?")
         for src in mod.get("sources", []):
             t = src.get("type", "")
@@ -101,6 +115,9 @@ def main():
                         f"  {name} archive: {url[:80]} → neither sha256 nor sha512 is valid"
                     )
             elif t == "file":
+                # Local files (no url) are git-tracked — skip checksum requirement
+                if not url:
+                    continue
                 sha256 = src.get("sha256", "")
                 sha512 = src.get("sha512", "")
                 if (not sha256 or len(sha256) != 64) and (not sha512 or len(sha512) != 128):
@@ -119,8 +136,8 @@ def main():
     else:
         print("✅ All archive sources have valid sha256 or sha512; file sources have valid sha256 or sha512")
 
-    # 6. Verify build-options.append-path exists on each module
-    for mod in modules:
+    # 6. Verify build-options.append-path exists on each named module
+    for mod in named_modules:
         name = mod.get("name", "?")
         bo = mod.get("build-options", {})
         ap = bo.get("append-path", "")

@@ -43,8 +43,8 @@ module_count=$(python3 -c "
 import yaml, sys
 with open('$MANIFEST') as f:
     data = yaml.safe_load(f)
-modules = data['modules']
-print(len(modules))
+named_modules = [m for m in data['modules'] if isinstance(m, dict) and 'name' in m]
+print(len(named_modules))
 ")
 check "Manifest has 3 modules" "[ \"$module_count\" -eq 3 ]"
 
@@ -53,6 +53,8 @@ import yaml, sys
 with open('$MANIFEST') as f:
     data = yaml.safe_load(f)
 for mod in data['modules']:
+    if not isinstance(mod, dict):
+        continue
     cmds = mod.get('build-commands', [])
     has_set_eu = any(c.strip() == 'set -eu' for c in cmds)
     print(f\"{mod['name']}: set-eu={'yes' if has_set_eu else 'NO'}\")

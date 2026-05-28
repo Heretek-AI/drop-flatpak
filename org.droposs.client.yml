@@ -1,6 +1,6 @@
 app-id: org.droposs.client
 runtime: org.gnome.Platform
-runtime-version: '48'
+runtime-version: '49'
 sdk: org.gnome.Sdk
 sdk-extensions:
 - org.freedesktop.Sdk.Extension.node22
@@ -12,6 +12,7 @@ finish-args:
 - --share=network
 - --filesystem=xdg-download
 - --talk-name=org.freedesktop.Notifications
+- --talk-name=org.kde.StatusNotifierWatcher
 cleanup:
 - /include
 - /lib/pkgconfig
@@ -37,17 +38,17 @@ modules:
     - git submodule update --init --recursive
   - type: archive
     url: https://static.rust-lang.org/dist/rustc-nightly-x86_64-unknown-linux-gnu.tar.xz
-    sha256: 6e280cf8889524b092214f9ed7c293bee43680988b00cc48cdac76c9df352c1d
+    sha256: d42b132a9e320f3d5ed31556f39c8167578e37dd619001ea877ff799625dce61
     strip-components: 1
     dest: rust-nightly/rustc
   - type: archive
     url: https://static.rust-lang.org/dist/cargo-nightly-x86_64-unknown-linux-gnu.tar.xz
-    sha256: c5421d7fad5e5c3596ba6c0748e4441a87deb237a56e1ef7c1551c0dc93dd3cd
+    sha256: 7261220eb1b693e9f9fccac50a59ba17e69c2aa7e4d8767a6d283dfc06c87455
     strip-components: 1
     dest: rust-nightly/cargo
   - type: archive
     url: https://static.rust-lang.org/dist/rust-std-nightly-x86_64-unknown-linux-gnu.tar.xz
-    sha256: d590f515075c54918d48cb16c77677633b5a5245e4055655fdc82c1ab7983f13
+    sha256: 42925c20ba01b3b530ba43724eecb5b9604a9def21852894f9e75e2c0bc5fafa
     strip-components: 1
     dest: rust-nightly/rust-std
   - type: file
@@ -8207,6 +8208,7 @@ modules:
   - node build.mjs
   - 'test -f main/.output/public/index.html && echo "Nuxt build verified: main/.output/public/index.html exists"'
   - mkdir -p /app/share/drop-frontend && cp -r .output/. /app/share/drop-frontend/
+- shared-modules/libappindicator/libappindicator-gtk3-12.10.json
 - name: drop-app-rust
   buildsystem: simple
   build-options:
@@ -8220,9 +8222,6 @@ modules:
     url: https://github.com/Drop-OSS/drop-app
     commit: c9ceb3f50ea061f0023f87211775e8380a181cbc
     disable-shallow-clone: true
-  - type: file
-    path: flatpak-patches/patch-tray-icon.py
-    dest: flatpak-patches
   - type: git
     url: https://github.com/drop-oss/droplet-rs
     commit: f17a585b563d874ef9a09c27be5169b7e728d148
@@ -8237,17 +8236,17 @@ modules:
     path: org.droposs.client.metainfo.xml
   - type: archive
     url: https://static.rust-lang.org/dist/rustc-nightly-x86_64-unknown-linux-gnu.tar.xz
-    sha256: 6e280cf8889524b092214f9ed7c293bee43680988b00cc48cdac76c9df352c1d
+    sha256: d42b132a9e320f3d5ed31556f39c8167578e37dd619001ea877ff799625dce61
     strip-components: 1
     dest: rust-nightly/rustc
   - type: archive
     url: https://static.rust-lang.org/dist/cargo-nightly-x86_64-unknown-linux-gnu.tar.xz
-    sha256: c5421d7fad5e5c3596ba6c0748e4441a87deb237a56e1ef7c1551c0dc93dd3cd
+    sha256: 7261220eb1b693e9f9fccac50a59ba17e69c2aa7e4d8767a6d283dfc06c87455
     strip-components: 1
     dest: rust-nightly/cargo
   - type: archive
     url: https://static.rust-lang.org/dist/rust-std-nightly-x86_64-unknown-linux-gnu.tar.xz
-    sha256: d590f515075c54918d48cb16c77677633b5a5245e4055655fdc82c1ab7983f13
+    sha256: 42925c20ba01b3b530ba43724eecb5b9604a9def21852894f9e75e2c0bc5fafa
     strip-components: 1
     dest: rust-nightly/rust-std
   - type: archive
@@ -15740,8 +15739,6 @@ modules:
   - echo "droplet-rs = { path = \"$PWD/cargo/vendor/droplet-rs\" }" >> .cargo/config.toml
   - echo '[patch."https://github.com/Drop-OSS/native_model"]' >> .cargo/config.toml
   - echo "native_model = { path = \"$PWD/cargo/vendor/native_model\" }" >> .cargo/config.toml
-  - sed -i 's/"tray-icon",\?\s*//g' src-tauri/Cargo.toml
-  - python3 flatpak-patches/patch-tray-icon.py src-tauri/src/lib.rs
   - ln -sf /app/share/drop-frontend .output
   - cd src-tauri && cargo build --release
   - cd ..
