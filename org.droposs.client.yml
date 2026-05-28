@@ -8206,6 +8206,7 @@ modules:
     ../flatpak-node-main/pnpm-store")|' build.mjs
   - node build.mjs
   - 'test -f main/.output/public/index.html && echo "Nuxt build verified: main/.output/public/index.html exists"'
+  - mkdir -p /app/share/drop-frontend && cp -r .output/. /app/share/drop-frontend/
 - name: drop-app-rust
   buildsystem: simple
   build-options:
@@ -15741,6 +15742,7 @@ modules:
   - echo "native_model = { path = \"$PWD/cargo/vendor/native_model\" }" >> .cargo/config.toml
   - sed -i 's/"tray-icon",\?\s*//g' src-tauri/Cargo.toml
   - python3 flatpak-patches/patch-tray-icon.py src-tauri/src/lib.rs
+  - ln -sf /app/share/drop-frontend .output
   - cd src-tauri && cargo build --release
   - cd ..
   - install -Dm755 src-tauri/target/release/drop-app /app/bin/drop-app
