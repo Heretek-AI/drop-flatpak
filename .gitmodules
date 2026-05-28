@@ -1,3 +1,9 @@
 [submodule "shared-modules"]
 	path = shared-modules
 	url = https://github.com/flathub/shared-modules.git
+[submodule "drop-app"]
+	path = drop-app
+	url = https://github.com/Drop-OSS/drop-app.git
+[submodule "flatpak-builder-tools"]
+	path = flatpak-builder-tools
+	url = https://github.com/flatpak/flatpak-builder-tools.git
